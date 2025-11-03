@@ -1357,6 +1357,20 @@ bool ClauseProcessor::processMap(
         mapTypeBits |= mlir::omp::ClauseMapFlags::ompx_hold;
     }
 
+    if (refMod) {
+       switch (*refMod) {
+        case Map::RefModifier::RefPtee:
+          mapTypeBits |= mlir::omp::ClauseMapFlags::ref_ptee;
+        break;
+        case Map::RefModifier::RefPtr:
+          mapTypeBits |= mlir::omp::ClauseMapFlags::ref_ptr;
+        break;
+        case Map::RefModifier::RefPtrPtee:
+          mapTypeBits |= mlir::omp::ClauseMapFlags::ref_ptr_ptee;
+        break;
+       }
+    }
+
     if (iterator) {
       TODO(currentLocation,
            "Support for iterator modifiers is not implemented yet");

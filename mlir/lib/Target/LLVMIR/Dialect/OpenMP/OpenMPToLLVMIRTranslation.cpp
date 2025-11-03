@@ -3873,56 +3873,57 @@ static llvm::Value *getSizeInBytes(DataLayout &dl, const mlir::Type &type,
   return builder.getInt64(dl.getTypeSizeInBits(type) / 8);
 }
 
+static bool checkHasClauseMapFlag(omp::ClauseMapFlags flag,
+                                  omp::ClauseMapFlags checkFlag) {
+  return (flag & checkFlag) == checkFlag;
+}
+
 // Convert the MLIR map flag set to the runtime map flag set for embedding
 // in LLVM-IR. This is important as the two bit-flag lists do not correspond
 // 1-to-1 as there's flags the runtime doesn't care about and vice versa.
 // Certain flags are discarded here such as RefPtee and co.
 static llvm::omp::OpenMPOffloadMappingFlags
 convertClauseMapFlags(omp::ClauseMapFlags mlirFlags) {
-  auto mapTypeToBool = [&mlirFlags](omp::ClauseMapFlags flag) {
-    return (mlirFlags & flag) == flag;
-  };
-
   llvm::omp::OpenMPOffloadMappingFlags mapType =
       llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_NONE;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::to))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::to))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::from))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::from))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::always))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::always))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::del))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::del))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_DELETE;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::return_param))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::return_param))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_RETURN_PARAM;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::priv))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::priv))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_PRIVATE;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::literal))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::literal))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_LITERAL;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::implicit))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::implicit))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::close))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::close))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_CLOSE;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::present))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::present))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_PRESENT;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::ompx_hold))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::ompx_hold))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_OMPX_HOLD;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::attach))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::attach))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH;
 
-  if (mapTypeToBool(omp::ClauseMapFlags::descriptor))
+  if (checkHasClauseMapFlag(mlirFlags, omp::ClauseMapFlags::descriptor))
     mapType |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_DESCRIPTOR;
 
   return mapType;
@@ -3954,10 +3955,16 @@ static void collectMapDataFromMapOperands(
   // Process MapOperands
   for (Value mapValue : mapVars) {
     auto mapOp = cast<omp::MapInfoOp>(mapValue.getDefiningOp());
-    Value offloadPtr =
-        mapOp.getVarPtrPtr() ? mapOp.getVarPtrPtr() : mapOp.getVarPtr();
+    bool isRefPtrOrPteeMapWithAttach =
+        checkHasClauseMapFlag(mapOp.getMapType(),
+                              omp::ClauseMapFlags::ref_ptr) &&
+        checkHasClauseMapFlag(mapOp.getMapType(), omp::ClauseMapFlags::attach);
+    Value offloadPtr = (mapOp.getVarPtrPtr() && !isRefPtrOrPteeMapWithAttach) ? mapOp.getVarPtrPtr()
+                                                               : mapOp.getVarPtr();
     mapData.OriginalValue.push_back(moduleTranslation.lookupValue(offloadPtr));
-    mapData.Pointers.push_back(mapData.OriginalValue.back());
+    mapData.Pointers.push_back(
+        isRefPtrOrPteeMapWithAttach ? moduleTranslation.lookupValue(mapOp.getVarPtrPtr())
+                    : mapData.OriginalValue.back());
 
     // if is declare target link OR to/enter in USM mode
     if (llvm::Value *refPtr =
@@ -4569,8 +4576,8 @@ void processAttachMap(LLVM::ModuleTranslation &moduleTranslation,
     // update it we can run into some unusual issues where the attachment is
     // still blocked.
     combinedInfo.Types.emplace_back(
-        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH |
-        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS);
+        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH/* |
+        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS*/);
     combinedInfo.DevicePointers.emplace_back(
         llvm::OpenMPIRBuilder::DeviceInfoTy::None);
     combinedInfo.Mappers.emplace_back(mapData.Mappers[mapDataIndex]);
@@ -4960,8 +4967,6 @@ static void genMapInfos(llvm::IRBuilderBase &builder,
   // utilise the size from any component of MapInfoData, if we can't
   // something is missing from the initial MapInfoData construction.
   for (size_t i = 0; i < mapData.MapClause.size(); ++i) {
-    // NOTE/TODO: We currently do not support arbitrary depth record
-    // type mapping.
     if (mapData.IsAMember[i])
       continue;
 
@@ -4971,7 +4976,6 @@ static void genMapInfos(llvm::IRBuilderBase &builder,
                               combinedInfo, mapData, i, targetDirective);
       continue;
     }
-
     processIndividualMap(builder, *ompBuilder, mapData, i, combinedInfo,
                          targetDirective);
   }

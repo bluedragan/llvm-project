@@ -2394,6 +2394,8 @@ mlir::translateModuleToLLVMIR(Operation *module, llvm::LLVMContext &llvmContext,
   if (failed(translator.createDependentLibrariesMetadata()))
     return nullptr;
 
+  // module->dump();
+
   // Convert other top-level operations if possible.
   for (Operation &o : getModuleBody(module).getOperations()) {
     if (!isa<LLVM::LLVMFuncOp, LLVM::AliasOp, LLVM::GlobalOp,
