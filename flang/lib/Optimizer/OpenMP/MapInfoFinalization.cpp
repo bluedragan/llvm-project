@@ -840,19 +840,29 @@ public:
         // to the runtime to try and attach the base address to the descriptor if it's available
         // and it's the first time the ref_ptr has been allocated on the device.
         auto newMapInfoOp = mlir::omp::MapInfoOp::create(
-            builder, op->getLoc(), op.getResult().getType(), op.getVarPtr(),
-            op.getVarTypeAttr(),
-            builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(
-                op.getMapType() & ~mlir::omp::ClauseMapFlags::ref_ptr),
-            op.getMapCaptureTypeAttr(), /*varPtrPtr=*/op.getVarPtrPtr(),
-            op.getMembers(), op.getMembersIndexAttr(),
-            /*bounds=*/mlir::SmallVector<mlir::Value>{},
-            /*mapperId*/ mlir::FlatSymbolRefAttr(), op.getNameAttr(),
-            /*partial_map=*/builder.getBoolAttr(false));
-        genImplicitAttachMap(op, descriptor, target, builder,
-                             mlir::omp::ClauseMapFlags::ref_ptr);
-        op.replaceAllUsesWith(newMapInfoOp.getResult());
-        op->erase();
+          builder, op->getLoc(), op.getResult().getType(), op.getVarPtr(),
+          op.getVarTypeAttr(),
+          builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(
+              op.getMapType() & ~mlir::omp::ClauseMapFlags::ref_ptr),
+          op.getMapCaptureTypeAttr(), /*varPtrPtr=*/op.getVarPtrPtr(),
+          op.getMembers(), op.getMembersIndexAttr(),
+          /*bounds=*/mlir::SmallVector<mlir::Value>{},
+          /*mapperId*/ mlir::FlatSymbolRefAttr(), op.getNameAttr(),
+          /*partial_map=*/builder.getBoolAttr(false));
+
+          // If we're a map exiting construct we skip the generation of the
+          // attach map, it should be unnecessary in these cases as it exists to
+          // bind the pointer and pointee and shouldn't increment or decrement
+          // the ref counter on its own. However, equally having it doesn't
+          // cause issues either, it's just ideal to remove the noise where
+          // feasible.
+          // TODO: Extend this to perhaps check for target updates and target data
+          //  with release and from applied.
+          if (!llvm::isa<mlir::omp::TargetExitDataOp>(target))
+            genImplicitAttachMap(op, descriptor, target, builder,
+                                 mlir::omp::ClauseMapFlags::ref_ptr);
+          op.replaceAllUsesWith(newMapInfoOp.getResult());
+          op->erase();
     } else if ((op.getMapType() & mlir::omp::ClauseMapFlags::ref_ptee) ==
                mlir::omp::ClauseMapFlags::ref_ptee) {
 
@@ -881,6 +891,10 @@ public:
       //   we're a binding map, or would this cause issues? Or perhaps there's a better way to simplify the backend 
       //   mappings by splitting them into 3 seperate maps in the else clause below, but it might cause issues for derived types
       //   need to test first....
+      // 7) - If 6 works then re-viist if we need attach maps on exit directives for the main combined map, it may have been tied to the fact the lowering 
+      //      found itn eccessary
+      // 8) Can perhaps revisit if we can detach the need for adding base_addresses to the members_of, but might be better to leave that
+      //     to the future for a while as it's more of a tidying up scenario than a neccessity.
 
       // For ref_ptee, we generate a map of the base address with user specified map types and
       // in the default auto attach case, we generate an additional attach map which indicates
@@ -889,6 +903,15 @@ public:
       auto newMapInfoOp = genBaseAddrMap(
           descriptor, op.getBounds(),
           op.getMapType() & ~mlir::omp::ClauseMapFlags::ref_ptee, builder);
+
+      // If we're a map exiting construct we skip the generation of the attach
+      // map, it should be unnecessary in these cases as it exists to bind the
+      // pointer and pointee and shouldn't increment or decrement the ref counter
+      // on its own. However, equally having it doesn't cause issues either, it's
+      // just ideal to remove the noise where feasible.
+      // TODO: Extend this to perhaps check for target updates and target data
+      //  with release and from applied.
+      if (!llvm::isa<mlir::omp::TargetExitDataOp>(target))
        genImplicitAttachMap(op, descriptor, target, builder,
                             mlir::omp::ClauseMapFlags::ref_ptee);
      op.replaceAllUsesWith(newMapInfoOp.getResult());
