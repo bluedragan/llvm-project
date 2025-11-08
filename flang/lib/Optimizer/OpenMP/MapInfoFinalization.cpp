@@ -443,7 +443,7 @@ public:
                          baseAddrIndex);
   }
 
-    // We add all mapped record members not directly used in the target region
+  // We add all mapped record members not directly used in the target region
   // to the block arguments in front of their parent and we place them into
   // the map operands list for consistency.
   //

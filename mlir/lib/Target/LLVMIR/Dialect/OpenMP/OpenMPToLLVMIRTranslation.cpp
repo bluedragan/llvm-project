@@ -4976,6 +4976,7 @@ static void genMapInfos(llvm::IRBuilderBase &builder,
                               combinedInfo, mapData, i, targetDirective);
       continue;
     }
+
     processIndividualMap(builder, *ompBuilder, mapData, i, combinedInfo,
                          targetDirective);
   }

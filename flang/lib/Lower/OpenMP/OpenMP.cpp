@@ -368,6 +368,7 @@ extractMappedBaseValues(llvm::ArrayRef<mlir::Value> vars,
   llvm::transform(vars, std::back_inserter(baseOps), [](mlir::Value map) {
     auto mapInfo = map.getDefiningOp<mlir::omp::MapInfoOp>();
     assert(mapInfo && "expected all map vars to be defined by omp.map.info");
+
     mlir::Value varPtr = mapInfo.getVarPtr();
     if (auto boxAddr = varPtr.getDefiningOp<fir::BoxAddrOp>())
       return boxAddr.getVal();
@@ -2521,39 +2522,6 @@ static bool isDuplicateMappedSymbol(
   return checkSymbol(sym.GetUltimate());
 }
 
-// TODO: If this works and we go this route, we need to cache the 
-// default mappers for each type and that we're binding to the
-// block args...
-//
-// Doesn't quite work without sticking a map operation in and that seems like
-// doing the same as Map None with extra steps...
-// static mlir::FlatSymbolRefAttr
-// getOrGenImplicitNoneDeclareMapper(lower::AbstractConverter &converter,
-//                                   mlir::Location loc, mlir::Type type,
-//                                   llvm::StringRef mapperNameStr) {
-//   if (converter.getModuleOp().lookupSymbol(mapperNameStr))
-//     return mlir::FlatSymbolRefAttr::get(&converter.getMLIRContext(),
-//                                         mapperNameStr);
-
-//   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
-
-//   // Save current insertion point before moving to the module scope to create
-//   // the DeclareMapperOp.
-//   mlir::OpBuilder::InsertionGuard guard(firOpBuilder);
-
-//   firOpBuilder.setInsertionPointToStart(converter.getModuleOp().getBody());
-//   auto declMapperOp = mlir::omp::DeclareMapperOp::create(firOpBuilder, loc,
-//                                                          mapperNameStr, type);
-//   auto &region = declMapperOp.getRegion();
-//   firOpBuilder.createBlock(&region);
-
-//   mlir::omp::DeclareMapperInfoOp::create(firOpBuilder, loc, mlir::Value{});
-
-//   declMapperOp.dump();
-//   return mlir::FlatSymbolRefAttr::get(&converter.getMLIRContext(),
-//                                       mapperNameStr);
-// }
-
 static mlir::omp::TargetOp
 genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
             lower::StatementContext &stmtCtx,
@@ -2658,8 +2626,7 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
       mlir::Value mapOp = createMapInfoOp(
           firOpBuilder, converter.getCurrentLocation(), baseOp,
           /*varPtrPtr=*/mlir::Value{}, name.str(), bounds, /*members=*/{},
-          /*membersIndex=*/mlir::ArrayAttr{},
-          std::get<0>(mapFlagAndKind),
+          /*membersIndex=*/mlir::ArrayAttr{}, std::get<0>(mapFlagAndKind),
           std::get<1>(mapFlagAndKind), baseOp.getType(),
           /*partialMap=*/false, mapperId);
 
@@ -2667,7 +2634,6 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
       mapSyms.push_back(&sym);
     }
   };
-
   lower::pft::visitAllSymbols(eval, captureImplicitMap);
 
   auto targetOp = mlir::omp::TargetOp::create(firOpBuilder, loc, clauseOps);
