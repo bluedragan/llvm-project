@@ -624,11 +624,12 @@ public:
   /// issues.
   mlir::omp::ClauseMapFlags
   getDescriptorMapType(mlir::omp::ClauseMapFlags mapTypeFlag,
-                       mlir::Operation *target, bool isHasDeviceAddr) {
+                       mlir::Operation *target, bool isHasDeviceAddr,
+                       bool isAttachNever = false) {
     using mapFlags = mlir::omp::ClauseMapFlags;
     mapFlags flags = mapFlags::none;
 
-    if (!isHasDeviceAddr)
+    if (!isHasDeviceAddr && !isAttachNever)
       flags |= mapFlags::attach;
 
     if (llvm::isa_and_nonnull<mlir::omp::TargetExitDataOp,
@@ -679,12 +680,16 @@ public:
 
   void genImplicitAttachMap(mlir::omp::MapInfoOp descMapOp,
                             mlir::Value descriptor, mlir::Operation *target,
-                            fir::FirOpBuilder &builder, mlir::omp::ClauseMapFlags refFlagType) {
+                            fir::FirOpBuilder &builder,
+                            mlir::omp::ClauseMapFlags refFlagType,
+                            bool isAttachAlways = false) {
     auto implicitAttachMap = mlir::omp::MapInfoOp::create(
         builder, descMapOp->getLoc(), descMapOp.getResult().getType(),
         descMapOp.getVarPtr(), descMapOp.getVarTypeAttr(),
         builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(
-            mlir::omp::ClauseMapFlags::attach | refFlagType),
+            mlir::omp::ClauseMapFlags::attach | refFlagType |
+            (isAttachAlways ? mlir::omp::ClauseMapFlags::always
+                            : mlir::omp::ClauseMapFlags::none)),
         descMapOp.getMapCaptureTypeAttr(), /*varPtrPtr=*/
         fir::BoxOffsetOp::create(builder, descMapOp->getLoc(), descriptor,
                                  fir::BoxFieldAttr::base_addr),
@@ -831,6 +836,13 @@ public:
     // TODO: map the addendum segment of the descriptor, similarly to the
     // base address/data pointer member.
     bool isHasDeviceAddrFlag = isHasDeviceAddr(op, *target);
+    bool isAttachNever =
+        (op.getMapType() & mlir::omp::ClauseMapFlags::attach_never) ==
+        mlir::omp::ClauseMapFlags::attach_never;
+    bool isAttachAlways =
+        (op.getMapType() & mlir::omp::ClauseMapFlags::attach_always) ==
+        mlir::omp::ClauseMapFlags::attach_always;
+
     mlir::Value descriptor =
         getDescriptorFromBoxMap(op, builder, descCanBeDeferred);
     if ((op.getMapType() & mlir::omp::ClauseMapFlags::ref_ptr) ==
@@ -858,43 +870,63 @@ public:
           // feasible.
           // TODO: Extend this to perhaps check for target updates and target data
           //  with release and from applied.
-          if (!llvm::isa<mlir::omp::TargetExitDataOp>(target))
-            genImplicitAttachMap(op, descriptor, target, builder,
-                                 mlir::omp::ClauseMapFlags::ref_ptr);
-          op.replaceAllUsesWith(newMapInfoOp.getResult());
-          op->erase();
+        if (!llvm::isa<mlir::omp::TargetExitDataOp>(target) && !isAttachNever)
+          genImplicitAttachMap(op, descriptor, target, builder,
+                               mlir::omp::ClauseMapFlags::ref_ptr,
+                               isAttachAlways);
+        op.replaceAllUsesWith(newMapInfoOp.getResult());
+        op->erase();
     } else if ((op.getMapType() & mlir::omp::ClauseMapFlags::ref_ptee) ==
                mlir::omp::ClauseMapFlags::ref_ptee) {
 
       // TODO/FIX:
-      // 0) i) create two variations of the test with ref_ptr/ptee shuffled around
-      //    ii)  test ref_ptr_ptee 
-      //    iii) test some other ref_ptr/ptee examples  (for example the stack descriptor getting stuck in memory example), and perhaps ask michael if he has any ideas
-      // - ask Michael what he thinks about turning off the descriptor deferral stuff for newer OpenMP versions by default
-      //   and having to provide a flag in those cases. Just so we can nudge people towards using ref_ptr/ptee in those 
-      //   cases (and so we can test the ref_ptr/ptee test trivially) - Might not really matter for downstream as we have 
-      //   a flag to toggle it, but I don't think upstream has it
-      //    iiiii) Make sure it works for all existing map tests and check-offload, check-smoke without breakages
-      //    iiiiii) Add these tests to check-smoke with a script that will verify the runtime trace and check attaches are happening at the right time
-      //    as well as transfers of the various bits and pieces...
-      // 1) Look into the possibility of teaching the backend to only require ATTACH map to do the more
-      //   unique mapping of accessing varPtr/varPtrPtr fields for basePointer/offloadPointer as opposed
-      //   to using the ref_ptee/ref_ptr types...
-      // 2) Remove the always map on the attach in lowering and try to find/fix the problem case so it's no
+      // 0) ii)  test ref_ptr_ptee
+      //    iii) test some other ref_ptr/ptee examples  (for example the stack
+      //    descriptor getting stuck in memory example), and perhaps ask michael
+      //    if he has any ideas iiiii) Make sure it works for all existing map
+      //    tests and check-offload, check-smoke without breakages iiiiii) Add
+      //    these tests to check-smoke with a script that will verify the
+      //    runtime trace and check attaches are happening at the right time as
+      //    well as transfers of the various bits and pieces...
+      // 1) Look into the possibility of teaching the backend to only require
+      // ATTACH map to do the more
+      //   unique mapping of accessing varPtr/varPtrPtr fields for
+      //   basePointer/offloadPointer as opposed to using the ref_ptee/ref_ptr
+      //   types...
+      // 2) Remove the always map on the attach in lowering and try to find/fix
+      // the problem case so it's no
       //   longer required...
       // 3) Implement attach always/auto/none
-      //    -  we'll want to apply ALWAYS when map always is given, and never apply when (perhaps in subsequent patch so as not to overload everything at once) attach none is provided, but the default case we will just generate this map. 
-      // 4) Test and fix if neccessary the derived type case for ref_ptr/ptee where we apply it to multiple nested
-      //    allocatables, the usual stuff needed to check and fix for descriptor derived type related stuff
+      //    -  we'll want to apply ALWAYS when map always is given, and never
+      //    apply when (perhaps in subsequent patch so as not to overload
+      //    everything at once) attach none is provided, but the default case we
+      //    will just generate this map.
+      // 4) Test and fix if neccessary the derived type case for ref_ptr/ptee
+      // where we apply it to multiple nested
+      //    allocatables, the usual stuff needed to check and fix for descriptor
+      //    derived type related stuff
       // 5) look at tidying everything up more.
-      //  6) - Can we simplify the attach map AND the way we bind the descriptors by using ref_ptr_ptee to indicate 
-      //   we're a binding map, or would this cause issues? Or perhaps there's a better way to simplify the backend 
-      //   mappings by splitting them into 3 seperate maps in the else clause below, but it might cause issues for derived types
-      //   need to test first....
-      // 7) - If 6 works then re-viist if we need attach maps on exit directives for the main combined map, it may have been tied to the fact the lowering 
+      //  6) - Can we simplify the attach map AND the way we bind the
+      //  descriptors by using ref_ptr_ptee to indicate
+      //   we're a binding map, or would this cause issues? Or perhaps there's a
+      //   better way to simplify the backend mappings by splitting them into 3
+      //   seperate maps in the else clause below, but it might cause issues for
+      //   derived types need to test first....
+      // 7) - If 6 works then re-viist if we need attach maps on exit directives
+      // for the main combined map, it may have been tied to the fact the
+      // lowering
       //      found itn eccessary
-      // 8) Can perhaps revisit if we can detach the need for adding base_addresses to the members_of, but might be better to leave that
-      //     to the future for a while as it's more of a tidying up scenario than a neccessity.
+      // 8) Can perhaps revisit if we can detach the need for adding
+      // base_addresses to the members_of, but might be better to leave that
+      //     to the future for a while as it's more of a tidying up scenario
+      //     than a neccessity.
+      // 9) ask Michael what he thinks about turning off the descriptor deferral
+      // stuff for newer OpenMP versions by default
+      //   and having to provide a flag in those cases. Just so we can nudge
+      //   people towards using ref_ptr/ptee in those cases (and so we can test
+      //   the ref_ptr/ptee test trivially) - Might not really matter for
+      //   downstream as we have a flag to toggle it, but I don't think upstream
+      //   has it
 
       // For ref_ptee, we generate a map of the base address with user specified map types and
       // in the default auto attach case, we generate an additional attach map which indicates
@@ -911,12 +943,16 @@ public:
       // just ideal to remove the noise where feasible.
       // TODO: Extend this to perhaps check for target updates and target data
       //  with release and from applied.
-      if (!llvm::isa<mlir::omp::TargetExitDataOp>(target))
-       genImplicitAttachMap(op, descriptor, target, builder,
-                            mlir::omp::ClauseMapFlags::ref_ptee);
-     op.replaceAllUsesWith(newMapInfoOp.getResult());
-     op->erase();
+      if (!llvm::isa<mlir::omp::TargetExitDataOp>(target) && !isAttachNever)
+        genImplicitAttachMap(op, descriptor, target, builder,
+                             mlir::omp::ClauseMapFlags::ref_ptee,
+                             isAttachAlways);
+      op.replaceAllUsesWith(newMapInfoOp.getResult());
+      op->erase();
     } else {
+
+      // TODO: Split this into multiple mappings like above, instead of a parent
+      // member mapping to try and simplify this and later lowering.
       bool isRefPtrPtee =
           (op.getMapType() & mlir::omp::ClauseMapFlags::ref_ptr_ptee) ==
           mlir::omp::ClauseMapFlags::ref_ptr_ptee;
@@ -939,11 +975,19 @@ public:
       // If we have been provided RefPtrPtee, utilise the user specified map
       // types as best we can only providing the additional map types necessary,
       // otherwise, use the default descriptor map type.
+
+      // NOTE: For the moment isAttachAlways, for this case is handled by not
+      // removing attach_always, and letting the later lowering handle it, the
+      // regular always map type isn't equivalent to attach_always at this
+      // level. At least yet, I have plans to refactor this all in a subsequent
+      // commit.
       auto mapType =
-          isRefPtrPtee ? (op.getMapType() | mlir::omp::ClauseMapFlags::attach |
-                          mlir::omp::ClauseMapFlags::descriptor)
-                       : getDescriptorMapType(op.getMapType(), target,
-                                              isHasDeviceAddrFlag);
+          isRefPtrPtee
+              ? (op.getMapType() | mlir::omp::ClauseMapFlags::descriptor |
+                 (isAttachNever ? mlir::omp::ClauseMapFlags::none
+                                : mlir::omp::ClauseMapFlags::attach))
+              : getDescriptorMapType(op.getMapType(), target,
+                                     isHasDeviceAddrFlag, isAttachNever);
       auto newMapInfoOp = mlir::omp::MapInfoOp::create(
           builder, op->getLoc(), op.getResult().getType(), descriptor,
           mlir::TypeAttr::get(fir::unwrapRefType(descriptor.getType())),

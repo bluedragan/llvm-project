@@ -1311,8 +1311,6 @@ bool ClauseProcessor::processMap(
     mlir::Location clauseLocation = converter.genLocation(source);
     const auto &[mapType, typeMods, attachMod, refMod, mappers, iterator,
                  objects] = clause.t;
-    if (attachMod)
-      TODO(currentLocation, "ATTACH modifier is not implemented yet");
     mlir::omp::ClauseMapFlags mapTypeBits = mlir::omp::ClauseMapFlags::none;
     std::string mapperIdName = "__implicit_mapper";
     // If the map type is specified, then process it else set the appropriate
@@ -1369,6 +1367,20 @@ bool ClauseProcessor::processMap(
           mapTypeBits |= mlir::omp::ClauseMapFlags::ref_ptr_ptee;
         break;
        }
+    }
+
+    if (attachMod) {
+      switch (*attachMod) {
+      case Map::AttachModifier::Always:
+        mapTypeBits |= mlir::omp::ClauseMapFlags::attach_always;
+        break;
+      case Map::AttachModifier::Never:
+        mapTypeBits |= mlir::omp::ClauseMapFlags::attach_never;
+        break;
+      case Map::AttachModifier::Auto:
+        mapTypeBits |= mlir::omp::ClauseMapFlags::attach_auto;
+        break;
+      }
     }
 
     if (iterator) {

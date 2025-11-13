@@ -4488,14 +4488,13 @@ gatherImmediateMembers(llvm::SmallVector<size_t> &immediateMapDataIdxs,
   }
 }
 
-void processAttachMap(LLVM::ModuleTranslation &moduleTranslation,
-                      llvm::IRBuilderBase &builder,
-                      llvm::OpenMPIRBuilder &ompBuilder, DataLayout &dl,
-                      MapInfosTy &combinedInfo, MapInfoData &mapData,
-                      uint64_t mapDataIndex, bool parentMap,
-                      llvm::SmallVectorImpl<size_t> &immediateMapDataIdxs,
-                      llvm::omp::OpenMPOffloadMappingFlags memberOfFlag,
-                      TargetDirective targetDirective) {
+static void processAttachMap(
+    LLVM::ModuleTranslation &moduleTranslation, llvm::IRBuilderBase &builder,
+    llvm::OpenMPIRBuilder &ompBuilder, DataLayout &dl, MapInfosTy &combinedInfo,
+    MapInfoData &mapData, uint64_t mapDataIndex, bool parentMap,
+    llvm::SmallVectorImpl<size_t> &immediateMapDataIdxs,
+    llvm::omp::OpenMPOffloadMappingFlags memberOfFlag,
+    TargetDirective targetDirective, bool alwaysAttach = false) {
   assert(!ompBuilder.Config.isTargetDevice() &&
          "function only supported for host device codegen");
   auto parentClause =
@@ -4576,8 +4575,9 @@ void processAttachMap(LLVM::ModuleTranslation &moduleTranslation,
     // update it we can run into some unusual issues where the attachment is
     // still blocked.
     combinedInfo.Types.emplace_back(
-        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH/* |
-        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS*/);
+        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH |
+        ((alwaysAttach) ? llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS
+                        : llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_NONE));
     combinedInfo.DevicePointers.emplace_back(
         llvm::OpenMPIRBuilder::DeviceInfoTy::None);
     combinedInfo.Mappers.emplace_back(mapData.Mappers[mapDataIndex]);
@@ -4841,9 +4841,15 @@ static void processMapWithMembersOf(LLVM::ModuleTranslation &moduleTranslation,
         llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH) {
       llvm::SmallVector<size_t> immediateMapDataIdxs;
       gatherImmediateMembers(immediateMapDataIdxs, mapData, parentClause, map);
-      processAttachMap(moduleTranslation, builder, ompBuilder, dl, combinedInfo,
-                       mapData, mapInfoIdx, i == 0, immediateMapDataIdxs,
-                       memberOfFlag, targetDirective);
+      // TODO: Handle attach_always more elegantly in the frontend, we will have
+      // to split up the ref_ptr_ptee/default Fortran pointer and allocatable
+      // mapping into their constituient components to do so.
+      processAttachMap(
+          moduleTranslation, builder, ompBuilder, dl, combinedInfo, mapData,
+          mapInfoIdx, i == 0, immediateMapDataIdxs, memberOfFlag,
+          targetDirective,
+          checkHasClauseMapFlag(map.getMapType(),
+                                omp::ClauseMapFlags::attach_always));
       i++;
       continue;
     }
