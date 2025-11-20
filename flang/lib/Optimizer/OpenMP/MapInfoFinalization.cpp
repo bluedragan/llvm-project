@@ -200,7 +200,7 @@ public:
         op.getMapTypeAttr(),
         builder.getAttr<mlir::omp::VariableCaptureKindAttr>(
             mlir::omp::VariableCaptureKind::ByRef),
-        /*varPtrPtr=*/mlir::Value{}, /*members=*/mlir::ValueRange{},
+        /*varPtrPtr=*/mlir::Value{}, /*varPtrPtr=*/mlir::TypeAttr{}, /*members=*/mlir::ValueRange{},
         /*members_index=*/mlir::ArrayAttr{}, bounds,
         /*mapperId=*/mlir::FlatSymbolRefAttr(),
         builder.getStringAttr(op.getNameAttr().strref() + "." + memberName +
@@ -308,7 +308,7 @@ public:
                                       fir::FirOpBuilder &builder,
                                       bool &canDescBeDeferred) {
     mlir::Value descriptor = boxMap.getVarPtr();
-    if (!fir::isTypeWithDescriptor(boxMap.getVarType()))
+    if (!fir::isTypeWithDescriptor(boxMap.getVarPtrType()))
       if (auto addrOp = mlir::dyn_cast_if_present<fir::BoxAddrOp>(
               boxMap.getVarPtr().getDefiningOp()))
         descriptor = addrOp.getVal();
@@ -377,22 +377,26 @@ public:
     mlir::Value baseAddrAddr = fir::BoxOffsetOp::create(
         builder, loc, descriptor, fir::BoxFieldAttr::base_addr);
 
-    mlir::Type underlyingVarType =
+    mlir::Type underlyingBaseAddrType =
         llvm::cast<mlir::omp::PointerLikeType>(
             fir::unwrapRefType(baseAddrAddr.getType()))
             .getElementType();
-    if (auto seqType = llvm::dyn_cast<fir::SequenceType>(underlyingVarType))
+    if (auto seqType =
+            llvm::dyn_cast<fir::SequenceType>(underlyingBaseAddrType))
       if (seqType.hasDynamicExtents())
-        underlyingVarType = seqType.getEleTy();
+        underlyingBaseAddrType = seqType.getEleTy();
+
+    mlir::Type underlyingDescType = fir::unwrapRefType(descriptor.getType());
 
     // Member of the descriptor pointing at the allocated data
     return mlir::omp::MapInfoOp::create(
         builder, loc, baseAddrAddr.getType(), descriptor,
-        mlir::TypeAttr::get(underlyingVarType),
+        mlir::TypeAttr::get(underlyingDescType),
         builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(mapType),
         builder.getAttr<mlir::omp::VariableCaptureKindAttr>(
             mlir::omp::VariableCaptureKind::ByRef),
-        baseAddrAddr, /*members=*/mlir::SmallVector<mlir::Value>{},
+        baseAddrAddr, mlir::TypeAttr::get(underlyingBaseAddrType),
+        /*members=*/mlir::SmallVector<mlir::Value>{},
         /*membersIndex=*/mlir::ArrayAttr{}, bounds,
         /*mapperId*/ mlir::FlatSymbolRefAttr(),
         /*name=*/builder.getStringAttr(""),
@@ -443,6 +447,85 @@ public:
                          baseAddrIndex);
   }
 
+  // This functions aims to insert new maps derived from existing maps into the
+  // corresponding clause list, interlinking it correctly with block arguments
+  // where required .
+  void addDerivedMemberToTarget(mlir::omp::MapInfoOp owner,
+                                mlir::omp::MapInfoOp derived,
+                                llvm::SmallVectorImpl<ParentAndPlacement> &mapMemberUsers,
+                                fir::FirOpBuilder &builder,
+                                mlir::Operation *target) {
+    auto addOperands = [&](mlir::MutableOperandRange &mapVarsArr,
+                           mlir::Operation *directiveOp,
+                           unsigned blockArgInsertIndex = 0) {
+      // Check we're inserting into the correct MapInfoOp list
+      if (!llvm::is_contained(mapVarsArr.getAsOperandRange(),
+                              mapMemberUsers.empty()
+                                  ? owner.getResult()
+                                  : mapMemberUsers[0].parent.getResult()))
+        return;
+
+      // Check we're not inserting a duplicate map.
+      if (llvm::is_contained(mapVarsArr.getAsOperandRange(),
+                              derived.getResult()))
+        return;
+
+      // There doesn't appear to be a simple way to convert MutableOperandRange
+      // to a vector currently, so we instead use a for_each to populate our
+      // vector.
+      llvm::SmallVector<mlir::Value> newMapOps;
+      newMapOps.reserve(mapVarsArr.size());
+      llvm::for_each(
+          mapVarsArr.getAsOperandRange(),
+          [&newMapOps](mlir::Value oper) { newMapOps.push_back(oper); });
+
+      newMapOps.push_back(derived);
+      if (directiveOp) {
+        directiveOp->getRegion(0).insertArgument(
+            blockArgInsertIndex, derived.getType(), derived.getLoc());
+        blockArgInsertIndex++;
+      }
+
+      mapVarsArr.assign(newMapOps);
+    };
+
+    auto argIface =
+        llvm::dyn_cast<mlir::omp::BlockArgOpenMPOpInterface>(target);
+
+    if (auto mapClauseOwner =
+            llvm::dyn_cast<mlir::omp::MapClauseOwningOpInterface>(target)) {
+      mlir::MutableOperandRange mapVarsArr = mapClauseOwner.getMapVarsMutable();
+      unsigned blockArgInsertIndex =
+          argIface
+              ? argIface.getMapBlockArgsStart() + argIface.numMapBlockArgs()
+              : 0;
+      addOperands(mapVarsArr,
+                  llvm::dyn_cast_if_present<mlir::omp::TargetOp>(
+                      argIface.getOperation()),
+                  blockArgInsertIndex);
+    }
+
+    if (auto targetDataOp = llvm::dyn_cast<mlir::omp::TargetDataOp>(target)) {
+      mlir::MutableOperandRange useDevAddrMutableOpRange =
+          targetDataOp.getUseDeviceAddrVarsMutable();
+      addOperands(useDevAddrMutableOpRange, target,
+                  argIface.getUseDeviceAddrBlockArgsStart() +
+                      argIface.numUseDeviceAddrBlockArgs());
+
+      mlir::MutableOperandRange useDevPtrMutableOpRange =
+          targetDataOp.getUseDevicePtrVarsMutable();
+      addOperands(useDevPtrMutableOpRange, target,
+                  argIface.getUseDevicePtrBlockArgsStart() +
+                      argIface.numUseDevicePtrBlockArgs());
+    } else if (auto targetOp = llvm::dyn_cast<mlir::omp::TargetOp>(target)) {
+      mlir::MutableOperandRange hasDevAddrMutableOpRange =
+          targetOp.getHasDeviceAddrVarsMutable();
+      addOperands(hasDevAddrMutableOpRange, target,
+                  argIface.getHasDeviceAddrBlockArgsStart() +
+                      argIface.numHasDeviceAddrBlockArgs());
+    }
+  }
+
   // We add all mapped record members not directly used in the target region
   // to the block arguments in front of their parent and we place them into
   // the map operands list for consistency.
@@ -482,14 +565,12 @@ public:
   // specification to map these (and any recursive components) in their
   // entirety, which is different to the C++ equivalent, which requires
   // explicit mapping of these segments.
-  void addImplicitMembersToTarget(mlir::omp::MapInfoOp op,
-                                  fir::FirOpBuilder &builder,
-                                  mlir::Operation *target,
-                                  bool insertMapOp = false) {
+void addImplicitMembersToTarget(mlir::omp::MapInfoOp op,
+                                   fir::FirOpBuilder &builder,
+                                   mlir::Operation *target) {
     auto mapClauseOwner =
         llvm::dyn_cast_if_present<mlir::omp::MapClauseOwningOpInterface>(
             target);
-
     // TargetDataOp is technically a MapClauseOwningOpInterface, so we
     // do not need to explicitly check for the extra cases here for use_device
     // addr/ptr
@@ -499,38 +580,27 @@ public:
     auto addOperands = [&](mlir::MutableOperandRange &mapVarsArr,
                            mlir::Operation *directiveOp,
                            unsigned blockArgInsertIndex = 0) {
-      if (!llvm::is_contained(mapVarsArr.getAsOperandRange(), op.getResult()) &&
-          !insertMapOp)
+      if (!llvm::is_contained(mapVarsArr.getAsOperandRange(), op.getResult()))
         return;
-
-      llvm::SmallVector<mlir::Value> newMapOps;
-      auto insertMap = [&](mlir::Value newInsert) {
-        newMapOps.push_back(newInsert);
-        if (directiveOp) {
-          directiveOp->getRegion(0).insertArgument(
-              blockArgInsertIndex, newInsert.getType(), newInsert.getLoc());
-          blockArgInsertIndex++;
-        }
-      };
 
       // There doesn't appear to be a simple way to convert MutableOperandRange
       // to a vector currently, so we instead use a for_each to populate our
       // vector.
+      llvm::SmallVector<mlir::Value> newMapOps;
       newMapOps.reserve(mapVarsArr.size());
       llvm::for_each(
           mapVarsArr.getAsOperandRange(),
           [&newMapOps](mlir::Value oper) { newMapOps.push_back(oper); });
 
-      // if the map doesn't exist on the target already, then we add it.
-      if (!llvm::is_contained(mapVarsArr.getAsOperandRange(), op.getResult()))
-        insertMap(op);
-
-      // Insert all of the members that the map contains into the new target map
-      // list.
       for (auto mapMember : op.getMembers()) {
         if (llvm::is_contained(mapVarsArr.getAsOperandRange(), mapMember))
           continue;
-        insertMap(mapMember);
+        newMapOps.push_back(mapMember);
+        if (directiveOp) {
+          directiveOp->getRegion(0).insertArgument(
+              blockArgInsertIndex, mapMember.getType(), mapMember.getLoc());
+          blockArgInsertIndex++;
+        }
       }
 
       mapVarsArr.assign(newMapOps);
@@ -624,6 +694,26 @@ public:
   /// issues.
   mlir::omp::ClauseMapFlags
   getDescriptorMapType(mlir::omp::ClauseMapFlags mapTypeFlag,
+                       mlir::Operation *target) {
+    using mapFlags = mlir::omp::ClauseMapFlags;
+    mapFlags flags = mapFlags::none;
+
+    if (llvm::isa_and_nonnull<mlir::omp::TargetExitDataOp,
+                              mlir::omp::TargetUpdateOp>(target)) {
+      flags |= mapTypeFlag | mapFlags::descriptor;
+      return flags;
+    }
+
+    flags |= mapFlags::to | mapFlags::descriptor | mapFlags::always |
+             (mapTypeFlag & mapFlags::implicit);
+
+    if (moduleRequiresUSM(target->getParentOfType<mlir::ModuleOp>()))
+      flags |= mapFlags::close;
+    return flags;
+  }
+
+    mlir::omp::ClauseMapFlags
+  getDescriptorMapType(mlir::omp::ClauseMapFlags mapTypeFlag,
                        mlir::Operation *target, bool isHasDeviceAddr,
                        bool isAttachNever = false) {
     using mapFlags = mlir::omp::ClauseMapFlags;
@@ -678,29 +768,58 @@ public:
     return false;
   }
 
-  void genImplicitAttachMap(mlir::omp::MapInfoOp descMapOp,
-                            mlir::Value descriptor, mlir::Operation *target,
-                            fir::FirOpBuilder &builder,
-                            mlir::omp::ClauseMapFlags refFlagType,
-                            bool isAttachAlways = false) {
+  void genImplicitAttachMap(
+      mlir::omp::MapInfoOp descMapOp, mlir::Value descriptor,
+      llvm::SmallVectorImpl<ParentAndPlacement> &mapMemberUsers,
+      mlir::Operation *target, fir::FirOpBuilder &builder,
+      mlir::omp::ClauseMapFlags refFlagType, bool isAttachAlways = false) {
+    // auto implicitAttachMap = mlir::omp::MapInfoOp::create(
+    //     builder, descMapOp->getLoc(), descMapOp.getResult().getType(),
+    //     descriptor,
+    //     mlir::TypeAttr::get(fir::unwrapRefType(descriptor.getType())),
+    //     builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(
+    //         mlir::omp::ClauseMapFlags::attach | refFlagType |
+    //         (isAttachAlways ? mlir::omp::ClauseMapFlags::always
+    //                         : mlir::omp::ClauseMapFlags::none)),
+    //     descMapOp.getMapCaptureTypeAttr(), /*varPtrPtr=*/
+    //     fir::BoxOffsetOp::create(builder, descMapOp->getLoc(), descriptor,
+    //                              fir::BoxFieldAttr::base_addr),
+    //     /*members=*/mlir::SmallVector<mlir::Value>{},
+    //     /*membersIndex=*/mlir::ArrayAttr{},
+    //     /*bounds=*/mlir::SmallVector<mlir::Value>{},
+    //     /*mapperId*/ mlir::FlatSymbolRefAttr(), descMapOp.getNameAttr(),
+    //     /*partial_map=*/builder.getBoolAttr(false));
+  
+    // AG NOTE: If we keep this make it a helper function
+    auto baseAddrAddr = fir::BoxOffsetOp::create(
+        builder, descMapOp->getLoc(), descriptor, fir::BoxFieldAttr::base_addr);
+    mlir::Type underlyingVarType =
+        llvm::cast<mlir::omp::PointerLikeType>(
+            fir::unwrapRefType(baseAddrAddr.getType()))
+            .getElementType();
+    if (auto seqType = llvm::dyn_cast<fir::SequenceType>(underlyingVarType))
+      if (seqType.hasDynamicExtents())
+        underlyingVarType = seqType.getEleTy();
+
     auto implicitAttachMap = mlir::omp::MapInfoOp::create(
         builder, descMapOp->getLoc(), descMapOp.getResult().getType(),
-        descMapOp.getVarPtr(), descMapOp.getVarTypeAttr(),
+        descriptor, mlir::TypeAttr::get(fir::unwrapRefType(descriptor.getType())),
         builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(
             mlir::omp::ClauseMapFlags::attach | refFlagType |
             (isAttachAlways ? mlir::omp::ClauseMapFlags::always
                             : mlir::omp::ClauseMapFlags::none)),
         descMapOp.getMapCaptureTypeAttr(), /*varPtrPtr=*/
-        fir::BoxOffsetOp::create(builder, descMapOp->getLoc(), descriptor,
-                                 fir::BoxFieldAttr::base_addr),
-        descMapOp.getMembers(), descMapOp.getMembersIndexAttr(),
-        /*bounds=*/mlir::SmallVector<mlir::Value>{},
+        baseAddrAddr, mlir::TypeAttr::get(underlyingVarType),
+        /*members=*/mlir::SmallVector<mlir::Value>{},
+        /*membersIndex=*/mlir::ArrayAttr{},
+        /*bounds=*/descMapOp.getBounds(),
         /*mapperId*/ mlir::FlatSymbolRefAttr(), descMapOp.getNameAttr(),
         /*partial_map=*/builder.getBoolAttr(false));
 
     // Has to be added to the target immediately, as we expect all maps
     // processed by this pass to have a user that is a target.
-    addImplicitMembersToTarget(implicitAttachMap, builder, target, true);
+    addDerivedMemberToTarget(descMapOp, implicitAttachMap, mapMemberUsers,
+                             builder, target);
   }
 
   // Expand mappings of type(C_PTR) to map their `__address` field explicitly
@@ -746,7 +865,7 @@ public:
         mlir::TypeAttr::get(fir::unwrapRefType(coord.getType())), mapTypeAttr,
         builder.getAttr<mlir::omp::VariableCaptureKindAttr>(
             mlir::omp::VariableCaptureKind::ByRef),
-        /*varPtrPtr=*/mlir::Value{},
+        /*varPtrPtr=*/mlir::Value{}, mlir::TypeAttr{},
         /*members=*/llvm::SmallVector<mlir::Value>{},
         /*member_index=*/mlir::ArrayAttr{},
         /*bounds=*/op.getBounds(),
@@ -757,8 +876,8 @@ public:
     // Rebuild the parent as a container with the `__address` member.
     mlir::omp::MapInfoOp newParent = mlir::omp::MapInfoOp::create(
         builder, op.getLoc(), op.getResult().getType(), op.getVarPtr(),
-        op.getVarTypeAttr(), mapTypeAttr, op.getMapCaptureTypeAttr(),
-        /*varPtrPtr=*/mlir::Value{},
+        op.getVarPtrTypeAttr(), mapTypeAttr, op.getMapCaptureTypeAttr(),
+        /*varPtrPtr=*/mlir::Value{}, mlir::TypeAttr{},
         /*members=*/llvm::SmallVector<mlir::Value>{memberMap},
         /*member_index=*/newMembersAttr,
         /*bounds=*/llvm::SmallVector<mlir::Value>{},
@@ -852,27 +971,28 @@ public:
         // to the runtime to try and attach the base address to the descriptor if it's available
         // and it's the first time the ref_ptr has been allocated on the device.
         auto newMapInfoOp = mlir::omp::MapInfoOp::create(
-          builder, op->getLoc(), op.getResult().getType(), op.getVarPtr(),
-          op.getVarTypeAttr(),
-          builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(
-              op.getMapType() & ~mlir::omp::ClauseMapFlags::ref_ptr),
-          op.getMapCaptureTypeAttr(), /*varPtrPtr=*/op.getVarPtrPtr(),
-          op.getMembers(), op.getMembersIndexAttr(),
-          /*bounds=*/mlir::SmallVector<mlir::Value>{},
-          /*mapperId*/ mlir::FlatSymbolRefAttr(), op.getNameAttr(),
-          /*partial_map=*/builder.getBoolAttr(false));
+            builder, op->getLoc(), op.getResult().getType(), op.getVarPtr(),
+            op.getVarPtrTypeAttr(),
+            builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(
+                op.getMapType() & ~mlir::omp::ClauseMapFlags::ref_ptr),
+            op.getMapCaptureTypeAttr(), /*varPtrPtr=*/op.getVarPtrPtr(),
+            /*varPtrPtrType=*/op.getVarPtrPtrTypeAttr(), op.getMembers(),
+            op.getMembersIndexAttr(),
+            /*bounds=*/mlir::SmallVector<mlir::Value>{},
+            /*mapperId*/ mlir::FlatSymbolRefAttr(), op.getNameAttr(),
+            /*partial_map=*/builder.getBoolAttr(false));
 
-          // If we're a map exiting construct we skip the generation of the
-          // attach map, it should be unnecessary in these cases as it exists to
-          // bind the pointer and pointee and shouldn't increment or decrement
-          // the ref counter on its own. However, equally having it doesn't
-          // cause issues either, it's just ideal to remove the noise where
-          // feasible.
-          // TODO: Extend this to perhaps check for target updates and target data
-          //  with release and from applied.
+        // If we're a map exiting construct we skip the generation of the
+        // attach map, it should be unnecessary in these cases as it exists to
+        // bind the pointer and pointee and shouldn't increment or decrement
+        // the ref counter on its own. However, equally having it doesn't
+        // cause issues either, it's just ideal to remove the noise where
+        // feasible.
+        // TODO: Extend this to perhaps check for target updates and target data
+        //  with release and from applied.
         if (!llvm::isa<mlir::omp::TargetExitDataOp>(target) && !isAttachNever)
-          genImplicitAttachMap(op, descriptor, target, builder,
-                               mlir::omp::ClauseMapFlags::ref_ptr,
+          genImplicitAttachMap(op, descriptor, mapMemberUsers, target, builder,
+                               mlir::omp::ClauseMapFlags::ref_ptr/*_ptee*/,
                                isAttachAlways);
         op.replaceAllUsesWith(newMapInfoOp.getResult());
         op->erase();
@@ -944,8 +1064,8 @@ public:
       // TODO: Extend this to perhaps check for target updates and target data
       //  with release and from applied.
       if (!llvm::isa<mlir::omp::TargetExitDataOp>(target) && !isAttachNever)
-        genImplicitAttachMap(op, descriptor, target, builder,
-                             mlir::omp::ClauseMapFlags::ref_ptee,
+        genImplicitAttachMap(op, descriptor, mapMemberUsers, target, builder,
+                             mlir::omp::ClauseMapFlags::ref_ptr_ptee,
                              isAttachAlways);
       op.replaceAllUsesWith(newMapInfoOp.getResult());
       op->erase();
@@ -981,26 +1101,41 @@ public:
       // regular always map type isn't equivalent to attach_always at this
       // level. At least yet, I have plans to refactor this all in a subsequent
       // commit.
-      auto mapType =
+       auto mapType =
           isRefPtrPtee
-              ? (op.getMapType() | mlir::omp::ClauseMapFlags::descriptor |
-                 (isAttachNever ? mlir::omp::ClauseMapFlags::none
-                                : mlir::omp::ClauseMapFlags::attach))
-              : getDescriptorMapType(op.getMapType(), target,
-                                     isHasDeviceAddrFlag, isAttachNever);
-      auto newMapInfoOp = mlir::omp::MapInfoOp::create(
-          builder, op->getLoc(), op.getResult().getType(), descriptor,
-          mlir::TypeAttr::get(fir::unwrapRefType(descriptor.getType())),
-          builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(mapType),
-          op.getMapCaptureTypeAttr(), /*varPtrPtr=*/mlir::Value{}, newMembers,
-          newMembersAttr, /*bounds=*/mlir::SmallVector<mlir::Value>{},
-          /*mapperId*/ mlir::FlatSymbolRefAttr(), op.getNameAttr(),
-          /*partial_map=*/builder.getBoolAttr(false));
-      op.replaceAllUsesWith(newMapInfoOp.getResult());
-      op->erase();
+              ? (op.getMapType() | mlir::omp::ClauseMapFlags::descriptor)
+              : getDescriptorMapType(op.getMapType(), target);
 
-      if (descCanBeDeferred)
-        deferrableDesc.push_back(newMapInfoOp);
+      // auto mapType =
+      //     isRefPtrPtee
+      //         ? (op.getMapType() | mlir::omp::ClauseMapFlags::descriptor |
+      //            (isAttachNever ? mlir::omp::ClauseMapFlags::none
+      //                           : mlir::omp::ClauseMapFlags::attach))
+      //         : getDescriptorMapType(op.getMapType(), target,
+      //                                isHasDeviceAddrFlag, isAttachNever);
+       auto newMapInfoOp = mlir::omp::MapInfoOp::create(
+           builder, op->getLoc(), op.getResult().getType(), descriptor,
+           mlir::TypeAttr::get(fir::unwrapRefType(descriptor.getType())),
+           builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(mapType),
+           op.getMapCaptureTypeAttr(), /*varPtrPtr=*/mlir::Value{},
+           /*varPtrPtTyper=*/mlir::TypeAttr{}, newMembers, newMembersAttr,
+           /*bounds=*/mlir::SmallVector<mlir::Value>{},
+           /*mapperId*/ mlir::FlatSymbolRefAttr(), op.getNameAttr(),
+           /*partial_map=*/builder.getBoolAttr(false));
+
+       // do we make this the unique case of not having this implicit attach map
+       // for now...?
+       // - as there's a lot of broken tests... 171 vs 150...
+       if (!llvm::isa<mlir::omp::TargetExitDataOp>(target) && !isAttachNever)
+         genImplicitAttachMap(op, descriptor, mapMemberUsers, target, builder,
+                              mlir::omp::ClauseMapFlags::ref_ptr_ptee,
+                              isAttachAlways);
+
+       op.replaceAllUsesWith(newMapInfoOp.getResult());
+       op->erase();
+
+       if (descCanBeDeferred)
+         deferrableDesc.push_back(newMapInfoOp);
     }
   }
 
@@ -1046,12 +1181,13 @@ public:
 
     mlir::omp::MapInfoOp newDescParentMapOp = mlir::omp::MapInfoOp::create(
         builder, op->getLoc(), op.getResult().getType(), op.getVarPtr(),
-        op.getVarTypeAttr(),
+        op.getVarPtrTypeAttr(),
         builder.getAttr<mlir::omp::ClauseMapFlagsAttr>(
             mlir::omp::ClauseMapFlags::to | mlir::omp::ClauseMapFlags::always |
             mlir::omp::ClauseMapFlags::descriptor),
         op.getMapCaptureTypeAttr(), /*varPtrPtr=*/mlir::Value{},
-        mlir::SmallVector<mlir::Value>{}, mlir::ArrayAttr{},
+        /*varPtrPtrType=*/mlir::TypeAttr{}, mlir::SmallVector<mlir::Value>{},
+        mlir::ArrayAttr{},
         /*bounds=*/mlir::SmallVector<mlir::Value>{},
         /*mapperId*/ mlir::FlatSymbolRefAttr(), op.getNameAttr(),
         /*partial_map=*/builder.getBoolAttr(false));
@@ -1108,8 +1244,9 @@ public:
         builder.loadIfRef(op->getLoc(), baseAddr.getVarPtrPtr());
     mlir::omp::MapInfoOp newBaseAddrMapOp = mlir::omp::MapInfoOp::create(
         builder, op->getLoc(), loadBaseAddr.getType(), loadBaseAddr,
-        baseAddr.getVarTypeAttr(), baseAddr.getMapTypeAttr(),
-        baseAddr.getMapCaptureTypeAttr(), mlir::Value{}, members, membersAttr,
+        baseAddr.getVarPtrTypeAttr(), baseAddr.getMapTypeAttr(),
+        baseAddr.getMapCaptureTypeAttr(), /*varPtrPtr=*/mlir::Value{},
+        /*varPtrPtrType=*/mlir::TypeAttr{}, members, membersAttr,
         baseAddr.getBounds(),
         /*mapperId*/ mlir::FlatSymbolRefAttr(), op.getNameAttr(),
         /*partial_map=*/builder.getBoolAttr(false));
@@ -1376,7 +1513,7 @@ public:
                "of a MapInfoOp");
 
         if (hasADescriptor(op.getVarPtr().getDefiningOp(),
-                           fir::unwrapRefType(op.getVarType()))) {
+                           fir::unwrapRefType(op.getVarPtrType()))) {
           builder.setInsertionPoint(op);
           mlir::Operation *targetUser = getFirstTargetUser(op);
           assert(targetUser && "expected user of map operation was not found");

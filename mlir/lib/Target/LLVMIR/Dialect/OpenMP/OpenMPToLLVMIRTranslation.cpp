@@ -3935,6 +3935,16 @@ static void collectMapDataFromMapOperands(
     llvm::IRBuilderBase &builder, ArrayRef<Value> useDevPtrOperands = {},
     ArrayRef<Value> useDevAddrOperands = {},
     ArrayRef<Value> hasDevAddrOperands = {}) {
+
+  auto checkRefPtrOrPteeMapWithAttach = [](omp::ClauseMapFlags mapType) {
+    bool hasRefType =
+        checkHasClauseMapFlag(mapType, omp::ClauseMapFlags::ref_ptr) ||
+        checkHasClauseMapFlag(mapType, omp::ClauseMapFlags::ref_ptee) ||
+        checkHasClauseMapFlag(mapType, omp::ClauseMapFlags::ref_ptr_ptee);
+    return hasRefType &&
+           checkHasClauseMapFlag(mapType, omp::ClauseMapFlags::attach);
+  };
+
   auto checkIsAMember = [](const auto &mapVars, auto mapOp) {
     // Check if this is a member mapping and correctly assign that it is, if
     // it is a member of a larger object.
@@ -3955,10 +3965,7 @@ static void collectMapDataFromMapOperands(
   // Process MapOperands
   for (Value mapValue : mapVars) {
     auto mapOp = cast<omp::MapInfoOp>(mapValue.getDefiningOp());
-    bool isRefPtrOrPteeMapWithAttach =
-        checkHasClauseMapFlag(mapOp.getMapType(),
-                              omp::ClauseMapFlags::ref_ptr) &&
-        checkHasClauseMapFlag(mapOp.getMapType(), omp::ClauseMapFlags::attach);
+    bool isRefPtrOrPteeMapWithAttach = checkRefPtrOrPteeMapWithAttach(mapOp.getMapType());
     Value offloadPtr = (mapOp.getVarPtrPtr() && !isRefPtrOrPteeMapWithAttach) ? mapOp.getVarPtrPtr()
                                                                : mapOp.getVarPtr();
     mapData.OriginalValue.push_back(moduleTranslation.lookupValue(offloadPtr));
@@ -3979,11 +3986,27 @@ static void collectMapDataFromMapOperands(
       mapData.BasePointers.push_back(mapData.OriginalValue.back());
     }
 
-    mapData.BaseType.push_back(
-        moduleTranslation.convertType(mapOp.getVarType()));
-    mapData.Sizes.push_back(
-        getSizeInBytes(dl, mapOp.getVarType(), mapOp, mapData.Pointers.back(),
-                       mapData.BaseType.back(), builder, moduleTranslation));
+    // In every situation we currently have if we have a varPtrPtr present
+    // we wish to utilise it's type for the base type, main cases are
+    // currently Fortran descriptor base address maps and attach maps.
+    mapData.BaseType.push_back(moduleTranslation.convertType(
+        mapOp.getVarPtrPtr() ? mapOp.getVarPtrPtrType().value()
+                             : mapOp.getVarPtrType()));
+
+    // For the attach map cases, it's a little odd, as we effectively have to
+    // utilise the base address (including all bounds offsets) for the pointer
+    // field, the pointer address for the base address field, and the pointer
+    // not the data (base addresses) size. So we end up with a mix of base
+    // types and sizes we wish to insert here.
+    mlir::Type sizeType = (isRefPtrOrPteeMapWithAttach || !mapOp.getVarPtrPtr())
+                              ? mapOp.getVarPtrType()
+                              : mapOp.getVarPtrPtrType().value();
+
+    mapData.Sizes.push_back(getSizeInBytes(
+        dl, sizeType, isRefPtrOrPteeMapWithAttach ? nullptr : mapOp,
+        mapData.Pointers.back(), moduleTranslation.convertType(sizeType),
+        builder, moduleTranslation));
+
     mapData.MapClause.push_back(mapOp.getOperation());
     mapData.Types.push_back(convertClauseMapFlags(mapOp.getMapType()));
     mapData.Names.push_back(LLVM::createMappingInformation(
@@ -4038,7 +4061,7 @@ static void collectMapDataFromMapOperands(
         mapData.IsDeclareTarget.push_back(false);
         mapData.BasePointers.push_back(mapData.OriginalValue.back());
         mapData.BaseType.push_back(
-            moduleTranslation.convertType(mapOp.getVarType()));
+            moduleTranslation.convertType(mapOp.getVarPtrType()));
 
         // If we're an attach map, we need to maintain the size currently, even
         // if we're not sending data, as the runtime (at least currently)
@@ -4047,7 +4070,7 @@ static void collectMapDataFromMapOperands(
              llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH) ==
             llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH) {
           mapData.Sizes.push_back(getSizeInBytes(
-              dl, mapOp.getVarType(), mapOp, mapData.Pointers.back(),
+              dl, mapOp.getVarPtrType(), mapOp, mapData.Pointers.back(),
               mapData.BaseType.back(), builder, moduleTranslation));
         } else {
           mapData.Sizes.push_back(builder.getInt64(0));
@@ -4082,9 +4105,9 @@ static void collectMapDataFromMapOperands(
     mapData.Pointers.push_back(origValue);
     mapData.IsDeclareTarget.push_back(false);
     mapData.BaseType.push_back(
-        moduleTranslation.convertType(mapOp.getVarType()));
+        moduleTranslation.convertType(mapOp.getVarPtrType()));
     mapData.Sizes.push_back(
-        builder.getInt64(dl.getTypeSize(mapOp.getVarType())));
+        builder.getInt64(dl.getTypeSize(mapOp.getVarPtrType())));
     mapData.MapClause.push_back(mapOp.getOperation());
     if (llvm::to_underlying(mapType & mapTypeAlways)) {
       // Descriptors are mapped with the ALWAYS flag, since they can get
@@ -4390,7 +4413,15 @@ processIndividualMap(llvm::IRBuilderBase &builder,
       !isPtrTy)
     mapFlag |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_LITERAL;
 
-  if (memberOfFlag != llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_NONE)
+  // if we have a pointer and it's part of a MEMBER_OF mapping we do not apply
+  // MEMBER_OF, as the runtime currently has a work-around that utilises
+  // MEMBER_OF to prevent reference updating in certain scenarios instead of
+  // target_param, however, this causes a noticable issue in cases where we
+  // map some data (Fortran descriptor primarily at the moment), alter it on
+  // the host, and then expect it to not be updated in a subsequent impliict map
+  // (such as an implicit map on a target).
+  if (memberOfFlag != llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_NONE &&
+      !isPtrTy)
     ompBuilder.setCorrectMemberOfFlag(mapFlag, memberOfFlag);
 
   // if we're provided a mapDataParentIdx, then the data being mapped is
@@ -4703,7 +4734,29 @@ static void mapParentWithMembers(
                        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_CLOSE;
     ompBuilder.setCorrectMemberOfFlag(mapFlag, memberOfFlag);
 
-    if (targetDirective == TargetDirective::TargetUpdate || hasMapClose) {
+    // AG NOTE: Forcing it into the top path works fine, we could temporarily
+    // force any mappings with attach into this path till we work out a
+    // solution, which will leave some avenue for the optimization... we would
+    // have to make the attach a member of the derived type then, and it's not
+    // really designed to have more members at the current index. Another method
+    // might be to traverse the masp and look for other members with a shared
+    // descriptor/address and check...
+    //         part of the issue here is likely that the base address (element 0)
+    //         and the descriptors address, share the same initial address offset, 
+    //         so if we calcualte the size from them for the overlap, we end up with a size of 
+    ///         0, which is fine normally but the NewlyAllocated check takes into account size...
+    //           - What we can do:
+    //             1) adjust the lowering to take into account <= for the size part... unsure 
+    //               how accurate that would be long term
+    //             2) Adjust the size calculation here to use the size of the object if we have it pre-computed
+    //                rather than self-calculate it / a conditional to select it. The issue with this, is that
+    //                we likely haven't calculated the reality that it's a ptr and we're going to feed it 48, 
+    //                which technically isn't correrct... it should be 8... or nothing at all as it's either the 
+    //                data which isn't part of the object or the pointer in the descriptor, and it shouldn't really
+    //                be both. 
+    // AG NOTE: We will want to remove the target_param component of
+    // any processIndividualMap's that have ATTACH just to be safe.
+    // if (targetDirective == TargetDirective::TargetUpdate || hasMapClose) {
       combinedInfo.Types.emplace_back(mapFlag);
       combinedInfo.DevicePointers.emplace_back(
           mapData.DevicePointers[mapDataIndex]);
@@ -4714,66 +4767,66 @@ static void mapParentWithMembers(
           mapData.BasePointers[mapDataIndex]);
       combinedInfo.Pointers.emplace_back(mapData.Pointers[mapDataIndex]);
       combinedInfo.Sizes.emplace_back(mapData.Sizes[mapDataIndex]);
-    } else {
-      llvm::SmallVector<size_t> overlapIdxs;
-      // Find all of the members that "overlap", i.e. occlude other members that
-      // were mapped alongside the parent, e.g. member [0], occludes
-      getOverlappedMembers(overlapIdxs, mapData, parentClause);
-      // We need to make sure the overlapped members are sorted in order of
-      // lowest address to highest address
-      sortMapIndices(overlapIdxs, parentClause);
+    // } else {
+    //   llvm::SmallVector<size_t> overlapIdxs;
+    //   // Find all of the members that "overlap", i.e. occlude other members that
+    //   // were mapped alongside the parent, e.g. member [0], occludes
+    //   getOverlappedMembers(overlapIdxs, mapData, parentClause);
+    //   // We need to make sure the overlapped members are sorted in order of
+    //   // lowest address to highest address
+    //   sortMapIndices(overlapIdxs, parentClause);
 
-      lowAddr = builder.CreatePointerCast(mapData.Pointers[mapDataIndex],
-                                          builder.getPtrTy());
-      highAddr = builder.CreatePointerCast(
-          builder.CreateConstGEP1_32(mapData.BaseType[mapDataIndex],
-                                     mapData.Pointers[mapDataIndex], 1),
-          builder.getPtrTy());
+    //   lowAddr = builder.CreatePointerCast(mapData.Pointers[mapDataIndex],
+    //                                       builder.getPtrTy());
+    //   highAddr = builder.CreatePointerCast(
+    //       builder.CreateConstGEP1_32(mapData.BaseType[mapDataIndex],
+    //                                  mapData.Pointers[mapDataIndex], 1),
+    //       builder.getPtrTy());
 
-      // TODO: We may want to skip arrays/array sections in this as Clang does
-      // so it appears to be an optimisation rather than a neccessity though,
-      // but this requires further investigation. However, we would have to make
-      // sure to not exclude maps with bounds that ARE pointers, as these are
-      // processed as seperate components, i.e. pointer + data.
-      for (auto v : overlapIdxs) {
-        auto mapDataOverlapIdx = getMapDataMemberIdx(
-            mapData,
-            cast<omp::MapInfoOp>(parentClause.getMembers()[v].getDefiningOp()));
-        combinedInfo.Types.emplace_back(mapFlag);
-        combinedInfo.DevicePointers.emplace_back(
-            mapData.DevicePointers[mapDataOverlapIdx]);
-        combinedInfo.Mappers.emplace_back(mapData.Mappers[mapDataOverlapIdx]);
-        combinedInfo.Names.emplace_back(LLVM::createMappingInformation(
-            mapData.MapClause[mapDataIndex]->getLoc(), ompBuilder));
-        combinedInfo.BasePointers.emplace_back(
-            mapData.BasePointers[mapDataIndex]);
-        combinedInfo.Pointers.emplace_back(lowAddr);
-        combinedInfo.Sizes.emplace_back(builder.CreateIntCast(
-            builder.CreatePtrDiff(builder.getInt8Ty(),
-                                  mapData.OriginalValue[mapDataOverlapIdx],
-                                  lowAddr),
-            builder.getInt64Ty(), /*isSigned=*/true));
-        lowAddr = builder.CreateConstGEP1_32(
-            checkIfPointerMap(llvm::cast<omp::MapInfoOp>(
-                mapData.MapClause[mapDataOverlapIdx]))
-                ? builder.getPtrTy()
-                : mapData.BaseType[mapDataOverlapIdx],
-            mapData.BasePointers[mapDataOverlapIdx], 1);
-      }
+    //   // TODO: We may want to skip arrays/array sections in this as Clang does
+    //   // so it appears to be an optimisation rather than a neccessity though,
+    //   // but this requires further investigation. However, we would have to make
+    //   // sure to not exclude maps with bounds that ARE pointers, as these are
+    //   // processed as seperate components, i.e. pointer + data.
+    //   for (auto v : overlapIdxs) {
+    //     auto mapDataOverlapIdx = getMapDataMemberIdx(
+    //         mapData,
+    //         cast<omp::MapInfoOp>(parentClause.getMembers()[v].getDefiningOp()));
+    //     combinedInfo.Types.emplace_back(mapFlag);
+    //     combinedInfo.DevicePointers.emplace_back(
+    //         mapData.DevicePointers[mapDataOverlapIdx]);
+    //     combinedInfo.Mappers.emplace_back(mapData.Mappers[mapDataOverlapIdx]);
+    //     combinedInfo.Names.emplace_back(LLVM::createMappingInformation(
+    //         mapData.MapClause[mapDataIndex]->getLoc(), ompBuilder));
+    //     combinedInfo.BasePointers.emplace_back(
+    //         mapData.BasePointers[mapDataIndex]);
+    //     combinedInfo.Pointers.emplace_back(lowAddr);
+    //     combinedInfo.Sizes.emplace_back(builder.CreateIntCast(
+    //         builder.CreatePtrDiff(builder.getInt8Ty(),
+    //                               mapData.OriginalValue[mapDataOverlapIdx],
+    //                               lowAddr),
+    //         builder.getInt64Ty(), /*isSigned=*/true));
+    //     lowAddr = builder.CreateConstGEP1_32(
+    //         checkIfPointerMap(llvm::cast<omp::MapInfoOp>(
+    //             mapData.MapClause[mapDataOverlapIdx]))
+    //             ? builder.getPtrTy()
+    //             : mapData.BaseType[mapDataOverlapIdx],
+    //         mapData.BasePointers[mapDataOverlapIdx], 1);
+    //   }
 
-      combinedInfo.Types.emplace_back(mapFlag);
-      combinedInfo.DevicePointers.emplace_back(
-          mapData.DevicePointers[mapDataIndex]);
-      combinedInfo.Mappers.emplace_back(mapData.Mappers[mapDataIndex]);
-      combinedInfo.Names.emplace_back(LLVM::createMappingInformation(
-          mapData.MapClause[mapDataIndex]->getLoc(), ompBuilder));
-      combinedInfo.BasePointers.emplace_back(
-          mapData.BasePointers[mapDataIndex]);
-      combinedInfo.Pointers.emplace_back(lowAddr);
-      combinedInfo.Sizes.emplace_back(builder.CreateIntCast(
-          builder.CreatePtrDiff(builder.getInt8Ty(), highAddr, lowAddr),
-          builder.getInt64Ty(), true));
-    }
+    //   combinedInfo.Types.emplace_back(mapFlag);
+    //   combinedInfo.DevicePointers.emplace_back(
+    //       mapData.DevicePointers[mapDataIndex]);
+    //   combinedInfo.Mappers.emplace_back(mapData.Mappers[mapDataIndex]);
+    //   combinedInfo.Names.emplace_back(LLVM::createMappingInformation(
+    //       mapData.MapClause[mapDataIndex]->getLoc(), ompBuilder));
+    //   combinedInfo.BasePointers.emplace_back(
+    //       mapData.BasePointers[mapDataIndex]);
+    //   combinedInfo.Pointers.emplace_back(lowAddr);
+    //   combinedInfo.Sizes.emplace_back(builder.CreateIntCast(
+    //       builder.CreatePtrDiff(builder.getInt8Ty(), highAddr, lowAddr),
+    //       builder.getInt64Ty(), true));
+    // }
   }
 }
 
@@ -4884,9 +4937,16 @@ createAlteredByCaptureMap(MapInfoData &mapData,
   assert(!moduleTranslation.getOpenMPBuilder()->Config.isTargetDevice() &&
          "function only supported for host device codegen");
   for (size_t i = 0; i < mapData.MapClause.size(); ++i) {
-    // if it's declare target, skip it, it's handled separately.
-    if (!mapData.IsDeclareTarget[i]) {
-      auto mapOp = cast<omp::MapInfoOp>(mapData.MapClause[i]);
+    auto mapOp = cast<omp::MapInfoOp>(mapData.MapClause[i]);
+    bool isAttachMap =
+        ((convertClauseMapFlags(mapOp.getMapType()) &
+          llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH) ==
+         llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ATTACH);
+
+    // if it's declare target, skip it, it's handled separately. However, if
+    // it's declare target, and an attach map, we want to calculate the exact
+    // address offset so that we attach correctly.
+    if (!mapData.IsDeclareTarget[i] || (mapData.IsDeclareTarget[i] && isAttachMap)) {
       omp::VariableCaptureKind captureKind = mapOp.getMapCaptureType();
       bool isPtrTy = checkIfPointerMap(mapOp);
 
@@ -5653,7 +5713,7 @@ createDeviceArgumentAccessor(MapInfoData &mapData, llvm::Argument &arg,
       capture = mapOp.getMapCaptureType();
       // Get information of alignment of mapped object
       alignmentValue = typeToLLVMIRTranslator.getPreferredAlignment(
-          mapOp.getVarType(), ompBuilder.M.getDataLayout());
+          mapOp.getVarPtrType(), ompBuilder.M.getDataLayout());
       break;
     }
 
@@ -6125,7 +6185,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
       // So, we don't store it in any datastructure. Instead, we just
       // do some sanity checks on it right now.
       auto mapInfoOp = mappedValue.getDefiningOp<omp::MapInfoOp>();
-      [[maybe_unused]] Type varType = mapInfoOp.getVarType();
+      [[maybe_unused]] Type varType = mapInfoOp.getVarPtrType();
 
       // Check #1: Check that the type of the private variable matches
       // the type of the variable being mapped.
