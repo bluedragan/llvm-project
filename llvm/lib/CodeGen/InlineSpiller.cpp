@@ -1254,13 +1254,14 @@ void InlineSpiller::spillAroundUses(Register Reg) {
     LaneBitmask CoveringLanes = LaneBitmask::getNone();
     // Identify the subreg use(s). Skip if the instruction defines the register.
     // For copy bundles, get the covering lane masks.
-    if (TRI.shouldEnableSubRegSpillRestore() && !RI.Writes) {
+    if (!RI.Writes) {
       for (auto [MI, OpIdx] : Ops) {
         const MachineOperand &MO = MI->getOperand(OpIdx);
         assert(MO.isReg() && MO.getReg() == Reg);
         if (MO.isUse()) {
           SubReg = MO.getSubReg();
-          CoveringLanes |= TRI.getSubRegIndexLaneMask(SubReg);
+          if (SubReg)
+            CoveringLanes |= TRI.getSubRegIndexLaneMask(SubReg);
         }
       }
     }
@@ -1275,6 +1276,11 @@ void InlineSpiller::spillAroundUses(Register Reg) {
       // tuple.
       SubReg = TRI.getSubRegIdxFromLaneMask(CoveringLanes);
     }
+
+    // If the target doesn't support subreg reload, fallback to restoring the
+    // full tuple.
+    if (SubReg && !TRI.shouldEnableSubRegReload(SubReg))
+      SubReg = 0;
 
     const TargetRegisterClass *NewRC =
         SubReg ? TRI.getSubRegisterClass(OrigRC, SubReg) : nullptr;
