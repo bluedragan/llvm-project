@@ -65,11 +65,15 @@ if(${LIBOMP_OMPT_SUPPORT})
   )
 endif()
 if(${LIBOMP_FORTRAN_MODULES})
-  add_custom_command(TARGET libomp-mod POST_BUILD
+  # libomp-mod is an OBJECT library which does not have a POST_BUILD command.
+  # attach it to omp instead an ensure libomp-mod is built before.
+  add_custom_command(TARGET omp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory ${LIBOMP_EXPORTS_MOD_DIR}
     COMMAND ${CMAKE_COMMAND} -E copy omp_lib.mod ${LIBOMP_EXPORTS_MOD_DIR}
     COMMAND ${CMAKE_COMMAND} -E copy omp_lib_kinds.mod ${LIBOMP_EXPORTS_MOD_DIR}
   )
+  add_dependencies(omp libomp-mod)
+
   add_custom_command(TARGET omp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy omp_lib.h ${LIBOMP_EXPORTS_CMN_DIR}
   )
