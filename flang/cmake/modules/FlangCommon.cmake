@@ -71,6 +71,8 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif ()
 
 check_include_file("quadmath.h" FOUND_QUADMATH_H)
+message(FOUND_QUADMATH_H="${FOUND_QUADMATH_H}")
+
 if (FOUND_QUADMATH_H)
   message(STATUS "quadmath.h found without additional include paths")
   set(FLANG_INCLUDE_QUADMATH_H "<quadmath.h>")
