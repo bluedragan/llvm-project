@@ -70,6 +70,11 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   endif ()
 endif ()
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le")
+    list(APPEND CMAKE_REQUIRED_INCLUDES "/opt/rh/gcc-toolset-15/root/usr/lib/gcc/ppc64le-redhat-linux/15/include"
+)
+endif()
+
 check_include_file("quadmath.h" FOUND_QUADMATH_H)
 if (FOUND_QUADMATH_H)
   message(STATUS "quadmath.h found without additional include paths")

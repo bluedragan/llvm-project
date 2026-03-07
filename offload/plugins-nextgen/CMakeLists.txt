@@ -1,4 +1,7 @@
 # Common interface to handle creating a plugin library.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le")
+  add_compile_options(-mabi=ieeelongdouble)
+endif()
 set(common_dir ${CMAKE_CURRENT_SOURCE_DIR}/common)
 set(common_bin_dir ${CMAKE_CURRENT_BINARY_DIR}/common)
 add_subdirectory(common)
